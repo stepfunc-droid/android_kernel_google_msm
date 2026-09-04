@@ -1,0 +1,249 @@
+Nexus 7 2013 (flo) batteryless v2 design
+=========================================
+
+Purpose
+-------
+
+This kernel is for a permanently converted flo board powered by a regulated
+4.2 V source on VBAT.  A physical Li-ion cell and the BQ27541 fuel-gauge PCB
+are not required.  USB 5 V may still be connected for data, charger-type
+detection, or OTG-related operation.
+
+The design has two independent goals:
+
+1. Keep Android's power_supply ABI stable by presenting a fixed, healthy,
+   full virtual battery.
+2. Keep the SMB345 available for USB input detection, AICL and OTG, while
+   preventing it from charging the externally driven VBAT rail.
+
+This is a permanent build-time policy.  There is no runtime switch back to a
+real battery.
+
+Virtual battery contract
+------------------------
+
+The bq27541-battery I2C client remains registered because other flo code uses
+its cable and wireless callbacks.  The driver does not probe or access a
+physical BQ27541.  Its battery properties are constants:
+
+  PRESENT       1
+  HEALTH        POWER_SUPPLY_HEALTH_GOOD
+  CAPACITY      100 percent
+  TEMP          250 (25.0 degrees C)
+  VOLTAGE_NOW   4100000 microvolts
+  CURRENT_NOW   0
+  STATUS        POWER_SUPPLY_STATUS_FULL
+  TECHNOLOGY    POWER_SUPPLY_TECHNOLOGY_LION
+
+The AC, USB and wireless ONLINE properties remain dynamic.  They describe the
+detected input source and do not imply that VBAT charging is enabled.
+
+The following physical-battery features are removed:
+
+* all BQ27541 I2C/SMBus reads and writes;
+* the battery_smbus sysfs attribute;
+* low-battery GPIO 29 setup, IRQ, wake lock and delayed work;
+* capacity smoothing, low-capacity shutdown workarounds and gauge caching;
+* battery-temperature-driven SMB345 charging control.
+
+Periodic AICL maintenance is retained because it manages the USB input path,
+not battery state of charge.
+
+Charger policy
+--------------
+
+The SMB345 driver is retained.  Removing it would also remove or disturb USB
+charger-type notification, input-current limiting, ACOK handling, wireless
+input handling and OTG setup.
+
+Charging is disabled as a driver invariant:
+
+* SMB345 PIN_CTRL bits 6:5 are cleared, selecting I2C charge-enable control.
+* SMB345 command register A bit 1 is cleared, disabling charging.
+* The disable sequence is applied at probe and reasserted on cable detection,
+  resume and shutdown.
+* No code path may set command register A bit 1 or restore pin-based charging.
+* Float-voltage and battery thermal charging configuration are removed.  USB
+  and wireless input-current-limit configuration remains.
+
+The existing flo smb345_pin_control() implementation only changes the charge
+enable pin polarity.  It is therefore not used as the batteryless safety
+mechanism.
+
+Power-off behavior
+------------------
+
+Original flo code treats any attached USB/AC/wireless source as a reason to
+restart into bootloader charger mode during power-off.  A batteryless device
+has nothing to charge, so get_cable_status() returns false.  Dynamic ONLINE
+properties are unaffected.
+
+Safety boundary
+---------------
+
+This kernel does not provide galvanic isolation or reverse-current blocking.
+Its SMB345 configuration begins only after the kernel and I2C driver have
+started.  Boot ROM, bootloader, fastboot, a powered-off charger, a charger IC
+reset, or a failed I2C transaction can exist outside that guarantee.
+
+The external 4.2 V supply must tolerate the board's transient current demand.
+It should include reverse-current blocking, or the SMB345 BAT output must be
+physically isolated if measurement shows current flowing into the external
+supply when USB 5 V is connected.  Kernel policy is not a substitute for that
+hardware protection.
+
+Build-time verification
+-----------------------
+
+1. Build lineageos_flo_defconfig with no warnings introduced by these files.
+2. Confirm bq27541_battery.o has no references to I2C transfer helpers or the
+   low-battery GPIO.
+3. Confirm no SMB345 path sets CMD_A_CHG_ENABLED or selects pin-controlled
+   charging.
+4. Keep the previous force-100 boot image unchanged and package v2 under a new
+   name.
+
+Runtime verification with the battery PCB still installed
+----------------------------------------------------------
+
+Boot v2 temporarily with fastboot before flashing it permanently.  Check:
+
+  adb shell cat /sys/class/power_supply/battery/present
+  adb shell cat /sys/class/power_supply/battery/health
+  adb shell cat /sys/class/power_supply/battery/capacity
+  adb shell cat /sys/class/power_supply/battery/temp
+  adb shell cat /sys/class/power_supply/battery/voltage_now
+  adb shell cat /sys/class/power_supply/battery/current_now
+  adb shell cat /sys/class/power_supply/battery/status
+
+Expected values are 1, Good, 100, 250, 4100000, 0 and Full.  Also verify ADB,
+USB data, USB source detection, suspend/resume, reboot and power-off with USB
+5 V both absent and present.
+
+Read the SMB345 register dump from its existing reg_status sysfs node.  The
+exact I2C sysfs path varies, but register 06 must have bits 6:5 clear and
+register 30 must have bit 1 clear.
+
+Hardware verification after removing the battery PCB
+-----------------------------------------------------
+
+Use a current-limited bench supply for the first test.
+
+1. Apply only regulated VBAT and boot the device.
+2. Exercise CPU/GPU load and watch VBAT at the board for droop or transients.
+3. Connect USB 5 V without data traffic and measure VBAT current direction.
+4. Repeat with ADB/data active, suspend/resume, reboot and power-off.
+5. Stop if USB causes reverse current into the 4.2 V source, VBAT rises above
+   the external regulator set point, or the SMB345 register invariant is not
+   maintained.
+
+Success means software reports the virtual battery correctly and USB features
+work, but final acceptance also requires measured electrical safety.
+
+Temporary boot and automatic recovery
+-------------------------------------
+
+Use fastboot boot for the first tests:
+
+  adb reboot bootloader
+  fastboot devices
+  fastboot boot boot-batteryless-v2.img
+
+fastboot boot downloads the image into RAM and starts it without writing the
+boot partition.  A normal reboot, kernel-panic/watchdog reboot, or complete
+power cycle therefore loads the boot image that was already flashed on the
+device.  If the test kernel hangs instead of rebooting, force a power cycle;
+the next normal boot still uses the previously flashed image.
+
+This safety property no longer applies after running fastboot flash boot.  Do
+not flash v2 permanently until the temporary-boot test matrix has passed.
+
+Development and build host
+--------------------------
+
+The build host is:
+
+  ssh debian@192.168.1.200
+
+Relevant paths on that host are:
+
+  Source repository:
+    /home/debian/android_kernel_google_msm
+
+  AOSP ARM GCC 4.8 toolchain:
+    /home/debian/toolchains/arm-eabi-4.8
+
+  Batteryless v2 build output:
+    /home/debian/kernel-build/batteryless-v2
+
+  Original boot image supplied by the device owner:
+    /home/debian/boot.img
+
+  AOSP Android 11 boot-image tools:
+    /home/debian/tools/aosp-mkbootimg-android11
+
+  Packaged v2 kernel and boot image:
+    /home/debian/kernel-artifacts/flo-batteryless-v2/zImage
+    /home/debian/boot-batteryless-v2.img
+
+The host may be unable to reach upstream Git servers through the GFW.  If a
+future change needs new Git data or tools, fetch them on the local workstation
+first and then copy them to the Debian host.  Do not make the remote build
+depend on a successful Internet fetch.
+
+Build procedure
+---------------
+
+The old kernel tree contains a Python 2 gcc-wrapper.py, while this Debian host
+uses Python 3.  Pass CC explicitly to bypass that obsolete wrapper:
+
+  cd /home/debian/android_kernel_google_msm
+  make O=/home/debian/kernel-build/batteryless-v2 \
+    ARCH=arm \
+    CROSS_COMPILE=/home/debian/toolchains/arm-eabi-4.8/bin/arm-eabi- \
+    lineageos_flo_defconfig
+  make -j4 O=/home/debian/kernel-build/batteryless-v2 \
+    ARCH=arm \
+    CROSS_COMPILE=/home/debian/toolchains/arm-eabi-4.8/bin/arm-eabi- \
+    CC=/home/debian/toolchains/arm-eabi-4.8/bin/arm-eabi-gcc \
+    zImage
+
+The defconfig must be lineageos_flo_defconfig.  The generic flo_defconfig does
+not match this branch.
+
+The current verified artifacts are:
+
+  boot-batteryless-v2.img
+    SHA256 6b91d7efcb86b088f0d1f9757c0a7a65967ff509f4da91bcc492a12d8cdee5ec
+
+  zImage
+    SHA256 645fb3a6263464f6b160ae2ef42b32a39aae41178daa1ad29aaa084c55f4aab1
+
+The v2 boot image uses the ramdisk from /home/debian/boot.img and preserves
+its Android boot header version 0, 2048-byte page size, load addresses,
+Android 11 version, 2023-12 patch level and command line.  After repacking,
+unpack the result again and use cmp to verify both the new kernel and original
+ramdisk byte for byte.
+
+When another build is required
+------------------------------
+
+Documentation-only changes do not require rebuilding the kernel or boot
+image.  Any change to bq27541_battery.c, smb345-charger.c, a defconfig, or
+another compiled source requires both a new zImage build and a new boot-image
+package.  Use a new artifact name and checksum rather than overwriting a known
+working image.
+
+No further source change is currently required before the first temporary
+boot.  Runtime evidence may justify another revision if any of these occur:
+
+* a virtual battery property differs from the documented constant;
+* USB data, source detection, AICL, OTG, suspend or resume regresses;
+* SMB345 register 06 bits 6:5 or register 30 bit 1 do not remain clear;
+* shutdown with USB attached still enters charger mode;
+* logs show repeated BQ27541 transactions or low-battery IRQ activity.
+
+Reverse current, excessive VBAT voltage, or load-transient droop is a hardware
+finding.  Do not attempt to conceal it with another virtual-battery value;
+add reverse-current protection, isolate the charger output, or improve the
+external supply and wiring.

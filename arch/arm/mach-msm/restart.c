@@ -288,13 +288,16 @@ void msm_restart(char mode, const char *cmd)
 		__raw_writel(0x77665500, restart_reason);
 	}
 #ifdef CONFIG_LGE_CRASH_HANDLER
-	if (in_panic == 1)
-		set_kernel_crash_magic_number();
+	if (in_panic == 1) {
+		/* Diskless recovery policy: panic also returns to fastboot. */
+		__raw_writel(0x77665500, restart_reason);
+	}
 reset:
 #else
 	if (in_panic == 1) {
-		__raw_writel(0x6d630100, restart_reason);
-		pr_notice("in panic\n");
+		/* Diskless recovery policy: panic also returns to fastboot. */
+		__raw_writel(0x77665500, restart_reason);
+		pr_notice("in panic, rebooting to bootloader\n");
 		mdelay(500);
 	}
 #endif /* CONFIG_LGE_CRASH_HANDLER */

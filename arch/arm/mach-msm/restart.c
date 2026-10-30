@@ -47,6 +47,9 @@ extern unsigned get_cable_status(void);
 #define RESTART_REASON_ADDR 0x65C
 #define DLOAD_MODE_ADDR     0x0
 
+#define FLO_FASTBOOT_MODE   0x77665500
+#define FLO_NORMAL_MODE     0x77665501
+
 #define SCM_IO_DISABLE_PMIC_ARBITER	1
 
 #ifdef CONFIG_LGE_CRASH_HANDLER
@@ -272,7 +275,7 @@ void msm_restart(char mode, const char *cmd)
 
 	if (cmd != NULL) {
 		if (!strncmp(cmd, "bootloader", 10)) {
-			__raw_writel(0x77665500, restart_reason);
+			__raw_writel(FLO_FASTBOOT_MODE, restart_reason);
 		} else if (!strncmp(cmd, "recovery", 8)) {
 			__raw_writel(0x77665502, restart_reason);
 		} else if (!strncmp(cmd, "oem-", 4)) {
@@ -280,24 +283,19 @@ void msm_restart(char mode, const char *cmd)
 			code = simple_strtoul(cmd + 4, NULL, 16) & 0xff;
 			__raw_writel(0x6f656d00 | code, restart_reason);
 		} else {
-			/* Batteryless/diskless flo: normal reboot returns to fastboot. */
-			__raw_writel(0x77665500, restart_reason);
+			__raw_writel(FLO_NORMAL_MODE, restart_reason);
 		}
 	} else {
-		/* Batteryless/diskless flo: normal reboot returns to fastboot. */
-		__raw_writel(0x77665500, restart_reason);
+		__raw_writel(FLO_NORMAL_MODE, restart_reason);
 	}
 #ifdef CONFIG_LGE_CRASH_HANDLER
-	if (in_panic == 1) {
-		/* Diskless recovery policy: panic also returns to fastboot. */
-		__raw_writel(0x77665500, restart_reason);
-	}
+	if (in_panic == 1)
+		set_kernel_crash_magic_number();
 reset:
 #else
 	if (in_panic == 1) {
-		/* Diskless recovery policy: panic also returns to fastboot. */
-		__raw_writel(0x77665500, restart_reason);
-		pr_notice("in panic, rebooting to bootloader\n");
+		__raw_writel(0x6d630100, restart_reason);
+		pr_notice("in panic\n");
 		mdelay(500);
 	}
 #endif /* CONFIG_LGE_CRASH_HANDLER */
@@ -355,22 +353,45 @@ static int __init msm_restart_init(void)
 #endif
 	msm_tmr0_base = msm_timer_get_timer0_base();
 	restart_reason = MSM_IMEM_BASE + RESTART_REASON_ADDR;
-
-	/*
-	 * Diskless flo policy: pre-arm the next reset for bootloader/fastboot.
-	 * This does not reboot now.  A manual Start from fastboot still boots
-	 * normally; once this kernel starts, it arms the following reset again.
-	 * Pre-arming also covers reset paths that bypass msm_restart(), such as
-	 * some watchdog or abrupt warm-reset paths.
-	 */
-	if (machine_is_apq8064_flo()) {
-		__raw_writel(0x77665500, restart_reason);
-		mb();
-		pr_notice("flo: next reset pre-armed for bootloader/fastboot\n");
-	}
-
 	pm_power_off = msm_power_off;
 
 	return 0;
 }
 early_initcall(msm_restart_init);
+
+/*
+ * flo diskless fallback gate
+ * --------------------------
+ * Normal/cold boot of the flashed boot image is only a trampoline: send the
+ * device to stock fastboot before userspace starts.  If the boot image is
+ * entered from that fastboot session with Start/continue, the bootloader's
+ * FASTBOOT_MODE restart reason is still present, so allow exactly that boot
+ * to continue and immediately restore NORMAL_MODE for the next reboot.
+ *
+ * This matches the RAM-only lk2nd -> diskless workflow: a normal reboot from
+ * diskless writes NORMAL_MODE, so when control later falls back to the flashed
+ * boot partition this gate sends the device to fastboot again.
+ */
+static int __init flo_diskless_fastboot_gate(void)
+{
+	unsigned int reason;
+
+	if (!machine_is_apq8064_flo())
+		return 0;
+
+	reason = __raw_readl(restart_reason);
+
+	if (reason == FLO_FASTBOOT_MODE) {
+		pr_notice("flo: fastboot Start/continue detected; allowing this boot\n");
+		__raw_writel(FLO_NORMAL_MODE, restart_reason);
+		mb();
+		return 0;
+	}
+
+	pr_notice("flo: fallback boot reason=0x%08x; redirecting to fastboot\n",
+		  reason);
+	msm_restart(0, "bootloader");
+
+	return 0;
+}
+late_initcall(flo_diskless_fastboot_gate);

@@ -355,6 +355,20 @@ static int __init msm_restart_init(void)
 #endif
 	msm_tmr0_base = msm_timer_get_timer0_base();
 	restart_reason = MSM_IMEM_BASE + RESTART_REASON_ADDR;
+
+	/*
+	 * Diskless flo policy: pre-arm the next reset for bootloader/fastboot.
+	 * This does not reboot now.  A manual Start from fastboot still boots
+	 * normally; once this kernel starts, it arms the following reset again.
+	 * Pre-arming also covers reset paths that bypass msm_restart(), such as
+	 * some watchdog or abrupt warm-reset paths.
+	 */
+	if (machine_is_apq8064_flo()) {
+		__raw_writel(0x77665500, restart_reason);
+		mb();
+		pr_notice("flo: next reset pre-armed for bootloader/fastboot\n");
+	}
+
 	pm_power_off = msm_power_off;
 
 	return 0;
